@@ -1310,7 +1310,7 @@
               <div class="glass-panel rounded-2xl p-6 border border-indigo-500/30 space-y-3">
                 <div class="flex items-center justify-between">
                   <span class="text-xs font-bold uppercase tracking-wider text-indigo-400">Track B｜AI 語意品質評估 (Semantic Evaluation - 獨立標示)</span>
-                  <span class="text-[11px] text-slate-400">使用 BYOK Gemini API</span>
+                  <span class="text-[11px] text-slate-400 font-mono">BYOK Model: gemini-4-hydrogen</span>
                 </div>
                 <div id="val-ai-semantic-box" class="p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-300 leading-relaxed whitespace-pre-wrap">尚未執行 AI 語意評估。點擊上方「執行 Gemini AI 語意品質評估」即可針對方法論深度、語意連貫性與防護完備度進行審查。</div>
               </div>
@@ -1747,11 +1747,12 @@
             </div>
 
             <div class="p-4 rounded-xl bg-blue-500/10 border border-blue-500/30 text-xs text-blue-200 leading-relaxed">
-              <strong>安全承諾 (TC07)：</strong>您在此輸入的 Gemini API Key <strong>絕不寫入</strong> <code>localStorage</code>、<code>sessionStorage</code>、Firestore 或任何伺服器日誌。當您關閉或重新整理網頁時，金鑰即刻歸零。
+              <strong>安全承諾 (TC07)｜當前綁定模型：<code class="text-emerald-300 font-bold">gemini-4-hydrogen</code></strong><br/>
+              您在此輸入的 Gemini API Key <strong>絕不寫入</strong> <code>localStorage</code>、<code>sessionStorage</code>、Firestore 或任何伺服器日誌。當您關閉或重新整理網頁時，金鑰即刻歸零。
             </div>
 
             <div>
-              <label class="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">輸入您的 Google Gemini API Key</label>
+              <label class="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">輸入您的 Google Gemini API Key (驅動 gemini-4-hydrogen)</label>
               <div class="flex gap-2">
                 <div class="relative flex-1">
                   <input type="password" id="byok-key-input" placeholder="AIzaSy..." class="w-full pl-4 pr-10 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono focus:outline-none focus:border-blue-500" />
@@ -2011,7 +2012,9 @@
       collection, 
       getDocs, 
       addDoc,
-      arrayUnion
+      arrayUnion,
+      query,
+      where
     } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     // =========================================================
@@ -2130,24 +2133,49 @@
       if (!inMemoryGeminiApiKey) {
         throw new Error("尚未設定 BYOK Gemini API Key（可於右上角 BYOK 設定）");
       }
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(inMemoryGeminiApiKey)}`;
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-          generationConfig: { temperature: 0.35 }
-        })
-      });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData?.error?.message || `Gemini API 呼叫失敗 (${res.status})`);
+      const modelName = "gemini-4-hydrogen";
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(inMemoryGeminiApiKey)}`;
+      const payload = {
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: { temperature: 0.35 }
+      };
+
+      const delays = [1000, 2000, 4000];
+      let lastError = null;
+
+      for (let attempt = 0; attempt <= delays.length; attempt++) {
+        try {
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            const errMsg = errData?.error?.message || `Gemini API (${modelName}) 呼叫失敗 (${res.status})`;
+            if ((res.status === 429 || res.status >= 500) && attempt < delays.length) {
+              await new Promise(r => setTimeout(r, delays[attempt]));
+              continue;
+            }
+            throw new Error(errMsg);
+          }
+
+          const data = await res.json();
+          const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) throw new Error(`Gemini API (${modelName}) 未回傳有效文字內容`);
+          return text;
+        } catch (err) {
+          lastError = err;
+          if (attempt < delays.length && /Failed to fetch|NetworkError/i.test(err.message)) {
+            await new Promise(r => setTimeout(r, delays[attempt]));
+            continue;
+          }
+          throw err;
+        }
       }
-      const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error("Gemini API 未回傳有效文字內容");
-      return text;
+      throw lastError || new Error(`Gemini API (${modelName}) 請求失敗`);
     }
 
     window.filterUserManual = function() {
@@ -4792,12 +4820,11 @@ ${rawInput}
       ];
 
       try {
-        const snap = await getDocs(collection(db, "skills"));
+        const qSkills = query(collection(db, "skills"), where("ownerId", "==", uid));
+        const snap = await getDocs(qSkills);
         snap.forEach(docSnap => {
           const data = docSnap.data();
-          if (data.ownerId === uid) {
-            localSkillLibrary.push({ id: docSnap.id, ...data });
-          }
+          localSkillLibrary.push({ id: docSnap.id, ...data });
         });
       } catch (_) {}
 
